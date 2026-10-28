@@ -33,11 +33,11 @@ Talk to it by **double-clicking the pet** or pressing **Ctrl+Shift+Space**. Esc 
 
 ## The character
 
-The default body is **Capri**, a full-size sprite character from [capri-desktop](https://github.com/lachydotmcg/capri-desktop) by Lachy. ViviPet plays her sprite sheets with `SpriteRenderer.ts` (added by the patch). Her art is **not** in this repo: `integrations/capri/fetch_capri_assets.ps1` downloads it from capri-desktop at a pinned commit, together with its license.
+The default body is **Capri**, a full-size sprite character from [capri-desktop](https://github.com/lachydotmcg/capri-desktop) by Lachy. ViviPet plays her sprite sheets with `SpriteRenderer.ts` (added by the patch). Her sprite sheets live in `assets/capri/`, the copy you edit. `integrations/capri/fetch_capri_assets.ps1` syncs them into ViviPet; if that folder is empty it first downloads them from capri-desktop at a pinned commit. See [assets/README.md](assets/README.md) for swapping sprites and capturing pose previews.
 
 > Capri's art is licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0).
 > Required Notice: Copyright 2026 Lachy (https://github.com/lachydotmcg)
-> Personal / noncommercial use only. Anyone who gets a copy of the art must also get the license and this notice.
+> Personal / noncommercial use only. Anyone who gets a copy of the art must also get the license and this notice (kept in `assets/capri/`).
 
 How the companion's states map to her animations:
 
@@ -93,6 +93,8 @@ companion/llm.py      Ollama client
 companion/pet.py      ViviPet adapter client
 companion/server.py   HTTP API (/chat, /react, /feedback, /memory)
 integrations/vivipet/ patch + apply script + TTS config for the ViviPet body
-integrations/capri/   downloads Capri's sprite sheets + license (not stored here)
+integrations/capri/   syncs assets/capri into ViviPet (downloads it first if missing)
+assets/               Capri sprite sheets + license, pose previews (see assets/README.md)
+tools/preview/        pose capture + preview sheet scripts
 run_kokoro_logged.bat starts Kokoro with output logged to data/kokoro.log
 ```
