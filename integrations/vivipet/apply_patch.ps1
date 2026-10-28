@@ -18,6 +18,9 @@ try {
     git apply "$here\vivipet-companion.patch"
     Write-Host 'Patch applied.'
 
+    # Capri's sprite sheets (third-party art, noncommercial license) are downloaded, not stored in this repo
+    & (Join-Path $here '..\capri\fetch_capri_assets.ps1') -ViviPet $ViviPet
+
     Push-Location 'apps\desktop'
     npm install
     node node_modules\electron\install.js   # pnpm/npm sometimes skip Electron's binary download
