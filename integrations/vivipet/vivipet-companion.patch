@@ -1,0 +1,1993 @@
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 92f61f4..5489855 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -1,4 +1,4 @@
+-import { app, nativeImage } from 'electron';
++import { app, globalShortcut, nativeImage } from 'electron';
+ import * as path from 'path';
+ import log from 'electron-log';
+ import { createPetWindow, getPetWindow, setPetWindow } from './window';
+@@ -74,6 +74,17 @@ app.whenReady().then(async () => {
+     getTTSManager().setWindowGetter(getPetWindow);
+     startAdapterServer(getPetWindow);
+ 
++    // Global hotkey: open the companion chat box from anywhere
++    const chatHotkey = process.env.VIVIPET_CHAT_HOTKEY || 'Control+Shift+Space';
++    const registered = globalShortcut.register(chatHotkey, () => {
++      const win = getPetWindow();
++      if (!win || win.isDestroyed()) return;
++      win.show();
++      win.focus();
++      win.webContents.send('pet:action', 'chat:toggle');
++    });
++    log.info(`Chat hotkey ${chatHotkey} ${registered ? 'registered' : 'FAILED to register'}`);
++
+     log.info('ViviPet initialized successfully');
+   } catch (error) {
+     log.error('Failed to initialize:', error);
+@@ -92,6 +103,10 @@ app.on('window-all-closed', () => {
+ // - before-quit fires first, but we do nothing here
+ // - the window's close handler sees !isQuitting → preventDefault + hide
+ // - the quit is aborted, app stays alive
++app.on('will-quit', () => {
++  globalShortcut.unregisterAll();
++});
++
+ app.on('before-quit', () => {
+   log.info('before-quit fired (will be intercepted if not from tray Quit)');
+ });
+diff --git a/apps/desktop/electron/model-manager.ts b/apps/desktop/electron/model-manager.ts
+index d0c60dc..5c8f0de 100644
+--- a/apps/desktop/electron/model-manager.ts
++++ b/apps/desktop/electron/model-manager.ts
+@@ -378,6 +378,8 @@ export function listUserModels(): Array<{
+ 
+ export function indexBundledModels(models: BundledModelConfig[]): void {
+   for (const model of models) {
++    // Code-drawn characters (e.g. "procedural:chibi") have no model3.json to index
++    if (model.path.startsWith('procedural:')) continue;
+     const modelPath = resolveBundledModelPath(model.path);
+     if (!modelPath) continue;
+ 
+diff --git a/apps/desktop/electron/tray.ts b/apps/desktop/electron/tray.ts
+index e8f07da..e79a7eb 100644
+--- a/apps/desktop/electron/tray.ts
++++ b/apps/desktop/electron/tray.ts
+@@ -22,7 +22,7 @@ function buildTTSSubmenu(): MenuItemConstructorOptions[] {
+   const sourceLabels: Record<string, string> = {
+     none: 'Disabled',
+     system: 'System (macOS)',
+-    local: 'Local Service',
++    local: 'Local Service (Kokoro)',
+     cloud: 'Cloud API',
+   };
+ 
+@@ -55,6 +55,10 @@ function buildTTSSubmenu(): MenuItemConstructorOptions[] {
+       checked: config.source === src,
+       click: () => {
+         tts.setConfig({ source: src, enabled: src !== 'none' });
++        if (src === 'local' && !tts.getConfig().local) {
++          // Default local service: Kokoro-FastAPI (OpenAI-compatible)
++          tts.setConfig({ local: { url: 'http://127.0.0.1:8880/v1/audio/speech', api: 'openai', voice: 'af_heart', model: 'kokoro' } });
++        }
+         if (tray) tray.setContextMenu(buildTrayMenu());
+         log.info(`[Tray] TTS source: ${src}`);
+       },
+diff --git a/apps/desktop/electron/tts/streamers/local-streamer.ts b/apps/desktop/electron/tts/streamers/local-streamer.ts
+index b055183..797624d 100644
+--- a/apps/desktop/electron/tts/streamers/local-streamer.ts
++++ b/apps/desktop/electron/tts/streamers/local-streamer.ts
+@@ -36,7 +36,9 @@ export async function* localStream(
+   const url = config.url || 'http://127.0.0.1:5000/tts';
+ 
+   // 本地服务通常使用大写首字母字段名（如 Text, Voice, Model, Instruct）
+-  const body = buildRequestBody(text, options);
++  // OpenAI-compatible services (Kokoro-FastAPI) use {model, input, voice}
++  const isOpenAI = config.api === 'openai' || /\/v1\/audio\/speech\/?$/.test(url);
++  const body = isOpenAI ? buildOpenAIRequestBody(text, options, config) : buildRequestBody(text, options);
+ 
+   log.info(`[LocalTTS] POST ${url} model=${options.model} voice=${(options as any).voice || '-'}`);
+ 
+@@ -126,6 +128,19 @@ export function abortLocalStream(): void {
+   abortController = null;
+ }
+ 
++/** OpenAI /v1/audio/speech body, as served by Kokoro-FastAPI */
++function buildOpenAIRequestBody(text: string, options: TTSSpeakOptions, config: LocalTTSConfig): Record<string, unknown> {
++  const voice = (options.model === 'preset' && options.voice) || config.voice || 'af_heart';
++  return {
++    model: config.model || 'kokoro',
++    input: text,
++    voice,
++    response_format: config.format === 'wav' ? 'wav' : 'mp3',
++    speed: config.speed ?? 1.0,
++    stream: true,
++  };
++}
++
+ /**
+  * 构建统一请求体
+  *
+diff --git a/apps/desktop/electron/tts/tts-config.ts b/apps/desktop/electron/tts/tts-config.ts
+index 9dcab34..96f867d 100644
+--- a/apps/desktop/electron/tts/tts-config.ts
++++ b/apps/desktop/electron/tts/tts-config.ts
+@@ -48,6 +48,11 @@ export interface SystemTTSConfig {
+ export interface LocalTTSConfig {
+   url: string;                // 默认 http://127.0.0.1:5000/tts
+   format?: 'wav' | 'mp3' | 'pcm';
++  /** 'vivipet' = {Text, Voice, Model} body; 'openai' = OpenAI /v1/audio/speech body (Kokoro-FastAPI) */
++  api?: 'vivipet' | 'openai';
++  voice?: string;             // default voice for openai api, e.g. af_heart
++  model?: string;             // model name for openai api, e.g. kokoro
++  speed?: number;
+ }
+ 
+ /** 云端 TTS 配置 */
+diff --git a/apps/desktop/electron/tts/tts-manager.ts b/apps/desktop/electron/tts/tts-manager.ts
+index 6d8b1a9..d53cb01 100644
+--- a/apps/desktop/electron/tts/tts-manager.ts
++++ b/apps/desktop/electron/tts/tts-manager.ts
+@@ -232,7 +232,7 @@ export class TTSManager {
+     // 构建请求选项
+     const speakOptions: TTSSpeakOptions = options || {
+       text,
+-      voice: localConfig.url,
++      voice: localConfig.voice,
+       model: 'preset',
+     };
+ 
+diff --git a/apps/desktop/public/assets/models/models.json b/apps/desktop/public/assets/models/models.json
+index 6479b00..527ff44 100644
+--- a/apps/desktop/public/assets/models/models.json
++++ b/apps/desktop/public/assets/models/models.json
+@@ -1,27 +1,135 @@
+ {
+   "models": [
++    {
++      "id": "vivi-chibi",
++      "name": "Vivi (Chibi)",
++      "path": "procedural:chibi",
++      "window": {
++        "width": 250,
++        "height": 306
++      },
++      "canvas": {
++        "width": 250,
++        "height": 306
++      },
++      "capabilities": {
++        "expressions": {
++          "neutral": "neutral",
++          "focused": "focused",
++          "happy": "happy",
++          "smile": "smile",
++          "sad": "sad",
++          "worried": "worried",
++          "angry": "angry",
++          "surprised": "surprised",
++          "confused": "confused",
++          "shy": "shy"
++        }
++      }
++    },
+     {
+       "id": "vivian",
+       "name": "Vivian",
+       "path": "/models/Vivian/Vivian.model3.json",
+-      "window": { "width": 570, "height": 675 },
+-      "canvas": { "width": 570, "height": 675 },
++      "window": {
++        "width": 570,
++        "height": 675
++      },
++      "canvas": {
++        "width": 570,
++        "height": 675
++      },
+       "actions": {
+-        "idle": { "motion": { "group": "Idle", "index": 0 } },
+-        "thinking": { "motion": { "group": "Thinking", "index": 0 } },
+-        "reading": { "motion": { "group": "Thinking", "index": 0 } },
+-        "searching": { "motion": { "group": "Thinking", "index": 0 } },
+-        "coding": { "motion": { "group": "Coding", "index": 0 } },
+-        "terminal": { "motion": { "group": "Terminal", "index": 0 } },
+-        "testing": { "motion": { "group": "Testing", "index": 0 } },
+-        "waiting_user": { "motion": { "group": "Thinking", "index": 0 } },
+-        "speaking": { "motion": { "group": "Idle", "index": 0 } },
+-        "success": { "motion": { "group": "Success", "index": 0 } },
+-        "happy": { "motion": { "group": "Success", "index": 0 } },
+-        "error": { "motion": { "group": "Error", "index": 0 } },
+-        "clicked": { "motion": { "group": "Idle", "index": 0 } },
+-        "doubleClicked": { "motion": { "group": "Success", "index": 0 } },
+-        "dragging": { "motion": { "group": "Idle", "index": 0 } }
++        "idle": {
++          "motion": {
++            "group": "Idle",
++            "index": 0
++          }
++        },
++        "thinking": {
++          "motion": {
++            "group": "Thinking",
++            "index": 0
++          }
++        },
++        "reading": {
++          "motion": {
++            "group": "Thinking",
++            "index": 0
++          }
++        },
++        "searching": {
++          "motion": {
++            "group": "Thinking",
++            "index": 0
++          }
++        },
++        "coding": {
++          "motion": {
++            "group": "Coding",
++            "index": 0
++          }
++        },
++        "terminal": {
++          "motion": {
++            "group": "Terminal",
++            "index": 0
++          }
++        },
++        "testing": {
++          "motion": {
++            "group": "Testing",
++            "index": 0
++          }
++        },
++        "waiting_user": {
++          "motion": {
++            "group": "Thinking",
++            "index": 0
++          }
++        },
++        "speaking": {
++          "motion": {
++            "group": "Idle",
++            "index": 0
++          }
++        },
++        "success": {
++          "motion": {
++            "group": "Success",
++            "index": 0
++          }
++        },
++        "happy": {
++          "motion": {
++            "group": "Success",
++            "index": 0
++          }
++        },
++        "error": {
++          "motion": {
++            "group": "Error",
++            "index": 0
++          }
++        },
++        "clicked": {
++          "motion": {
++            "group": "Idle",
++            "index": 0
++          }
++        },
++        "doubleClicked": {
++          "motion": {
++            "group": "Success",
++            "index": 0
++          }
++        },
++        "dragging": {
++          "motion": {
++            "group": "Idle",
++            "index": 0
++          }
++        }
+       },
+       "capabilities": {
+         "expressions": {
+@@ -35,8 +143,12 @@
+         },
+         "props": {
+           "umbrellaOff": {
+-            "enable": { "Param140": 1 },
+-            "disable": { "Param140": 0 }
++            "enable": {
++              "Param140": 1
++            },
++            "disable": {
++              "Param140": 0
++            }
+           }
+         }
+       }
+@@ -45,28 +157,129 @@
+       "id": "jian",
+       "name": "Jian",
+       "path": "/models/Jian/Jian.model3.json",
+-      "window": { "width": 563, "height": 525 },
+-      "canvas": { "width": 563, "height": 525 },
++      "window": {
++        "width": 563,
++        "height": 525
++      },
++      "canvas": {
++        "width": 563,
++        "height": 525
++      },
+       "actions": {
+-        "idle": { "motion": { "group": "Idle", "index": 0 } },
+-        "thinking": { "motion": { "group": "Shy", "index": 0 } },
+-        "reading": { "motion": { "group": "Idle", "index": 0 } },
+-        "searching": { "motion": { "group": "Shy", "index": 0 } },
+-        "coding": { "motion": { "group": "Idle", "index": 0 } },
+-        "terminal": { "motion": { "group": "Greeting", "index": 0 } },
+-        "testing": { "motion": { "group": "Idle", "index": 0 } },
+-        "waiting_user": { "motion": { "group": "Idle", "index": 0 } },
+-        "speaking": { "motion": { "group": "Idle", "index": 0 } },
+-        "success": { "motion": { "group": "Happy", "index": 0 } },
+-        "happy": { "motion": { "group": "Happy", "index": 0 } },
+-        "error": { "motion": { "group": "Angry", "index": 0 } },
+-        "greeting": { "motion": { "group": "Greeting", "index": 0 } },
+-        "shy": { "motion": { "group": "Shy", "index": 0 } },
+-        "angry": { "motion": { "group": "Angry", "index": 0 } },
+-        "surprised": { "motion": { "group": "Surprised", "index": 0 } },
+-        "clicked": { "motion": { "group": "Greeting", "index": 0 } },
+-        "doubleClicked": { "motion": { "group": "Happy", "index": 0 } },
+-        "dragging": { "motion": { "group": "Idle", "index": 0 } }
++        "idle": {
++          "motion": {
++            "group": "Idle",
++            "index": 0
++          }
++        },
++        "thinking": {
++          "motion": {
++            "group": "Shy",
++            "index": 0
++          }
++        },
++        "reading": {
++          "motion": {
++            "group": "Idle",
++            "index": 0
++          }
++        },
++        "searching": {
++          "motion": {
++            "group": "Shy",
++            "index": 0
++          }
++        },
++        "coding": {
++          "motion": {
++            "group": "Idle",
++            "index": 0
++          }
++        },
++        "terminal": {
++          "motion": {
++            "group": "Greeting",
++            "index": 0
++          }
++        },
++        "testing": {
++          "motion": {
++            "group": "Idle",
++            "index": 0
++          }
++        },
++        "waiting_user": {
++          "motion": {
++            "group": "Idle",
++            "index": 0
++          }
++        },
++        "speaking": {
++          "motion": {
++            "group": "Idle",
++            "index": 0
++          }
++        },
++        "success": {
++          "motion": {
++            "group": "Happy",
++            "index": 0
++          }
++        },
++        "happy": {
++          "motion": {
++            "group": "Happy",
++            "index": 0
++          }
++        },
++        "error": {
++          "motion": {
++            "group": "Angry",
++            "index": 0
++          }
++        },
++        "greeting": {
++          "motion": {
++            "group": "Greeting",
++            "index": 0
++          }
++        },
++        "shy": {
++          "motion": {
++            "group": "Shy",
++            "index": 0
++          }
++        },
++        "angry": {
++          "motion": {
++            "group": "Angry",
++            "index": 0
++          }
++        },
++        "surprised": {
++          "motion": {
++            "group": "Surprised",
++            "index": 0
++          }
++        },
++        "clicked": {
++          "motion": {
++            "group": "Greeting",
++            "index": 0
++          }
++        },
++        "doubleClicked": {
++          "motion": {
++            "group": "Happy",
++            "index": 0
++          }
++        },
++        "dragging": {
++          "motion": {
++            "group": "Idle",
++            "index": 0
++          }
++        }
+       },
+       "capabilities": {
+         "expressions": {
+@@ -84,4 +297,4 @@
+       }
+     }
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/apps/desktop/src/App.tsx b/apps/desktop/src/App.tsx
+index 58aa186..431b48f 100644
+--- a/apps/desktop/src/App.tsx
++++ b/apps/desktop/src/App.tsx
+@@ -1,6 +1,7 @@
+ import React, { useEffect, useCallback, useRef, useState } from 'react';
+ import { PetStage } from './components/PetStage';
+ import { SpeechBubble } from './components/SpeechBubble';
++import { ChatBox } from './components/ChatBox';
+ import { usePetStore } from './stores/pet-store';
+ import { loadModelConfigs, ModelConfig } from './features/pet/model-registry';
+ import { StreamingAudioPlayer } from './audio/streaming-player';
+@@ -61,6 +62,7 @@ const App: React.FC = () => {
+   const previousMousePassthroughRef = useRef<string | undefined>(undefined);
+   const settingsPanelRef = useRef<HTMLDivElement>(null);
+   const [settingsOpen, setSettingsOpen] = useState(false);
++  const [chatOpen, setChatOpen] = useState(false);
+   const [settingsPosition, setSettingsPosition] = useState({ x: 24, y: 24 });
+   const [aiConfig, setAIConfig] = useState<AIPlannerConfigSnapshot | null>(null);
+   const [activeAIConfig, setActiveAIConfig] = useState<AIPlannerConfigSnapshot | null>(null);
+@@ -423,6 +425,7 @@ const App: React.FC = () => {
+     clearActionResetTimer();
+     setAction('doubleClicked');
+     scheduleIdle(500);
++    setChatOpen((open) => !open);
+   }, [clearActionResetTimer, scheduleIdle, setAction]);
+ 
+   const handleDragStart = useCallback(() => {
+@@ -528,6 +531,11 @@ const App: React.FC = () => {
+           return;
+         }
+ 
++        if (action === 'chat:toggle') {
++          setChatOpen((open) => !open);
++          return;
++        }
++
+         // Handle mouse follow toggle
+         if (action === 'mouseFollow:on' || action === 'mouseFollow:off') {
+           const enabled = action === 'mouseFollow:on';
+@@ -622,6 +630,15 @@ const App: React.FC = () => {
+             onClose={hideBubble}
+           />
+         )}
++        <ChatBox
++          open={chatOpen}
++          onClose={() => setChatOpen(false)}
++          onError={(message) => showBubble(message, 4000)}
++          onTyping={() => {
++            clearActionResetTimer();
++            setAction('waiting_user');
++          }}
++        />
+       </PetStage>
+ 
+       {settingsOpen && aiConfig && (
+diff --git a/apps/desktop/src/components/PetStage.tsx b/apps/desktop/src/components/PetStage.tsx
+index 0d6e18b..dd9303a 100644
+--- a/apps/desktop/src/components/PetStage.tsx
++++ b/apps/desktop/src/components/PetStage.tsx
+@@ -1,6 +1,6 @@
+ import React, { useEffect, useRef, useState } from 'react';
+ import { PlayActionOptions } from '../features/pet/PetRenderer';
+-import { Live2DRenderer } from '../features/pet/Live2DRenderer';
++import { AnyPetRenderer, createPetRenderer, isRendererFor } from '../features/pet/renderer-factory';
+ import { resolveExpressionCapability, resolvePropCapabilities } from '../features/pet/capability-resolver';
+ import { BehaviorProp } from '../features/pet-events/behavior-plan';
+ import { getModelCanvasSize, ModelConfig } from '../features/pet/model-registry';
+@@ -58,7 +58,7 @@ export const PetStage: React.FC<PetStageProps> = ({
+ }) => {
+   const containerRef = useRef<HTMLDivElement>(null);
+   const canvasContainerRef = useRef<HTMLDivElement>(null);
+-  const rendererRef = useRef<Live2DRenderer | null>(null);
++  const rendererRef = useRef<AnyPetRenderer | null>(null);
+   const mousePassthroughRef = useRef<boolean | null>(null);
+   const isDraggingRef = useRef(false);
+   const prevModelIndex = useRef<number | null>(null);
+@@ -101,10 +101,12 @@ export const PetStage: React.FC<PetStageProps> = ({
+   };
+ 
+   const isPointInSpeechBubble = (clientX: number, clientY: number) => {
+-    const bubble = containerRef.current?.querySelector('.speech-bubble');
+-    if (!bubble) return false;
+-    const rect = bubble.getBoundingClientRect();
+-    return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
++    // Speech bubble and any interactive overlay (e.g. chat box) must stay clickable
++    const elements = containerRef.current?.querySelectorAll('.speech-bubble, .pet-interactive') ?? [];
++    return Array.from(elements).some((el) => {
++      const rect = el.getBoundingClientRect();
++      return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
++    });
+   };
+ 
+   const isPointInPetBounds = (clientX: number, clientY: number) => {
+@@ -122,11 +124,11 @@ export const PetStage: React.FC<PetStageProps> = ({
+     let disposed = false;
+ 
+     const initRenderer = async () => {
+-      console.log('[PetStage] Initializing Live2DRenderer...');
+-      const renderer = new Live2DRenderer();
++      const model = models[Math.min(modelIndex, models.length - 1)] ?? models[0];
++      console.log(`[PetStage] Initializing renderer for ${model.id}...`);
++      const renderer = createPetRenderer(model);
+       rendererRef.current = renderer;
+ 
+-      const model = models[Math.min(modelIndex, models.length - 1)] ?? models[0];
+       console.log(`[PetStage] Loading model from: ${model.path}`);
+ 
+       await renderer.loadModel(model);
+@@ -216,10 +218,23 @@ export const PetStage: React.FC<PetStageProps> = ({
+ 
+     let cancelled = false;
+     const switchModel = async () => {
+-      const renderer = rendererRef.current;
++      let renderer = rendererRef.current;
+       if (!renderer) return;
+       setModelLoaded(false);
+-      await renderer.switchModel(nextModel, modelIndex);
++      if (isRendererFor(renderer, nextModel)) {
++        await renderer.switchModel(nextModel, modelIndex);
++      } else {
++        // Live2D <-> chibi: replace the renderer and its canvas
++        renderer.destroy();
++        renderer = createPetRenderer(nextModel);
++        rendererRef.current = renderer;
++        await renderer.loadModel(nextModel);
++        const canvas = renderer.view;
++        if (canvas && canvasContainerRef.current) {
++          canvasContainerRef.current.replaceChildren(canvas);
++          canvas.style.display = 'block';
++        }
++      }
+       if (cancelled || rendererRef.current !== renderer) return;
+ 
+       const scale = parseFloat(document.documentElement.dataset.petScale || '1');
+@@ -513,7 +528,10 @@ export const PetStage: React.FC<PetStageProps> = ({
+     };
+ 
+     const detectBodyRegion = (clientX: number, clientY: number): string => {
+-      const bounds = rendererRef.current?.getOpaqueBoundsClient();
++      const current = rendererRef.current;
++      if (current && 'detectRegion' in current) return current.detectRegion(clientX, clientY);
++
++      const bounds = current?.getOpaqueBoundsClient();
+       if (!bounds || bounds.width <= 0 || bounds.height <= 0) return 'clothing';
+ 
+       const relX = (clientX - bounds.left) / bounds.width;
+@@ -573,7 +591,7 @@ export const PetStage: React.FC<PetStageProps> = ({
+       document.documentElement.dataset.petReactionEventCount = String(counter);
+       document.documentElement.dataset.petLastReactionRegion = region;
+       try {
+-        const res = await fetch('http://127.0.0.1:18810/api/character/react', {
++        const res = await fetch('http://127.0.0.1:18800/react', {
+           method: 'POST',
+           headers: { 'Content-Type': 'application/json' },
+           body: JSON.stringify({ region, caller: 'desktop', event_id: eventId }),
+diff --git a/apps/desktop/src/features/pet-events/behavior-planner.ts b/apps/desktop/src/features/pet-events/behavior-planner.ts
+index 7d7416d..0c4a3b5 100644
+--- a/apps/desktop/src/features/pet-events/behavior-planner.ts
++++ b/apps/desktop/src/features/pet-events/behavior-planner.ts
+@@ -18,7 +18,8 @@ export class RuleBasedBehaviorPlanner implements BehaviorPlanner {
+ 
+   async plan(event: PetStateEvent, context: BehaviorContext): Promise<BehaviorPlan> {
+     this.onTrace?.({ source: 'rule' });
+-    return composeBehaviorPlan(event, context.visiblePose);
++    // Momentary reactions (happy, error, surprised...) show their own pose; held sessions use the visible pose.
++    return composeBehaviorPlan(event, event.mode === 'momentary' ? event.action : context.visiblePose);
+   }
+ }
+ 
+diff --git a/apps/desktop/src/components/ChatBox.tsx b/apps/desktop/src/components/ChatBox.tsx
+new file mode 100644
+index 0000000..de57c16
+--- /dev/null
++++ b/apps/desktop/src/components/ChatBox.tsx
+@@ -0,0 +1,112 @@
++import React, { useEffect, useRef, useState } from 'react';
++
++/** Companion brain HTTP API (D:\AI\Companion, python main.py) */
++const COMPANION_URL = 'http://127.0.0.1:18800';
++
++interface ChatBoxProps {
++  open: boolean;
++  onClose: () => void;
++  onError: (message: string) => void;
++  /** Called when the user starts typing, so the pet can look attentive. */
++  onTyping?: () => void;
++}
++
++/** Small input box under the pet; replies arrive through the adapter as speech. */
++export const ChatBox: React.FC<ChatBoxProps> = ({ open, onClose, onError, onTyping }) => {
++  const [text, setText] = useState('');
++  const [busy, setBusy] = useState(false);
++  const inputRef = useRef<HTMLInputElement>(null);
++
++  useEffect(() => {
++    if (open) window.setTimeout(() => inputRef.current?.focus(), 50);
++  }, [open]);
++
++  const send = async () => {
++    const message = text.trim();
++    if (!message || busy) return;
++    setText('');
++    setBusy(true);
++    try {
++      const res = await fetch(`${COMPANION_URL}/chat`, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ text: message }),
++      });
++      if (!res.ok) throw new Error(`HTTP ${res.status}`);
++    } catch {
++      onError("I can't reach my brain - is the Companion running?");
++    } finally {
++      setBusy(false);
++      inputRef.current?.focus();
++    }
++  };
++
++  const feedback = (kind: 'like' | 'dislike') => {
++    fetch(`${COMPANION_URL}/feedback`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ kind }),
++    }).catch(() => {});
++  };
++
++  if (!open) return null;
++
++  return (
++    <div className="pet-interactive" style={boxStyles}>
++      <input
++        ref={inputRef}
++        value={text}
++        disabled={busy}
++        placeholder={busy ? 'Thinking...' : 'Say something...'}
++        onChange={(e) => {
++          if (!text && e.target.value) onTyping?.();
++          setText(e.target.value);
++        }}
++        onKeyDown={(e) => {
++          if (e.key === 'Enter') void send();
++          if (e.key === 'Escape') onClose();
++        }}
++        style={inputStyles}
++      />
++      <button title="I liked that" onClick={() => feedback('like')} style={iconButtonStyles}>👍</button>
++      <button title="Less of that" onClick={() => feedback('dislike')} style={iconButtonStyles}>👎</button>
++      <button title="Close (Esc)" onClick={onClose} style={iconButtonStyles}>×</button>
++    </div>
++  );
++};
++
++const boxStyles: React.CSSProperties = {
++  position: 'absolute',
++  right: '24px',
++  bottom: '12px',
++  width: '320px',
++  display: 'flex',
++  gap: '4px',
++  alignItems: 'center',
++  padding: '6px',
++  background: 'rgba(255, 255, 255, 0.96)',
++  borderRadius: '14px',
++  boxShadow: '0 8px 24px rgba(0, 0, 0, 0.25)',
++  border: '1px solid rgba(0, 0, 0, 0.08)',
++  zIndex: 110,
++  pointerEvents: 'auto',
++  fontFamily: 'system-ui, sans-serif',
++};
++
++const inputStyles: React.CSSProperties = {
++  flex: 1,
++  border: 'none',
++  outline: 'none',
++  background: 'transparent',
++  fontSize: '14px',
++  padding: '6px 8px',
++  color: '#1a202c',
++};
++
++const iconButtonStyles: React.CSSProperties = {
++  border: 'none',
++  background: 'transparent',
++  cursor: 'pointer',
++  fontSize: '15px',
++  padding: '2px 4px',
++};
+diff --git a/apps/desktop/src/features/pet/ChibiRenderer.ts b/apps/desktop/src/features/pet/ChibiRenderer.ts
+new file mode 100644
+index 0000000..235e484
+--- /dev/null
++++ b/apps/desktop/src/features/pet/ChibiRenderer.ts
+@@ -0,0 +1,1204 @@
++/**
++ * ChibiRenderer — an original, fully code-drawn chibi character ("Vivi").
++ *
++ * No image assets: everything is vector-drawn on a 2D canvas every frame, so poses,
++ * expressions, lip sync, eye tracking and hair physics are all procedural.
++ * Implements the same surface PetStage uses on Live2DRenderer, so it is a drop-in body.
++ *
++ * Design space is DESIGN_W x DESIGN_H; the figure is scaled to fit the canvas, feet at the bottom.
++ */
++import { PetRenderer, PlayActionOptions } from './PetRenderer';
++import { ModelConfig } from './model-registry';
++
++const DESIGN_W = 400;
++const DESIGN_H = 490;
++const HEAD = { x: 200, y: 200 };
++const FIGURE_BOUNDS = { x: 52, y: 26, w: 296, h: 446 }; // opaque area in design space
++
++const C = {
++  outline: '#3b2f5e',
++  skin: '#ffe6d8',
++  skinShade: '#f6c8b4',
++  blush: '#ff8fa8',
++  hairTop: '#a796f5',
++  hairBottom: '#6b5bd1',
++  hairShine: 'rgba(255,255,255,0.45)',
++  iris: '#22b8a8',
++  irisDark: '#0c5f58',
++  pupil: '#18233a',
++  hoodie: '#fff4e2',
++  hoodieShade: '#f0dcc0',
++  trim: '#26b3a3',
++  star: '#ffd34d',
++  tights: '#4a3f73',
++  shoe: '#2f2a4a',
++  mouth: '#b43c55',
++  tongue: '#ff8b9b',
++};
++
++type MouthShape = 'smile' | 'grin' | 'flat' | 'o' | 'frown' | 'cat' | 'wavy' | 'pout';
++type Effect = 'sparkles' | 'question' | 'exclaim' | 'sweat' | 'anger' | 'zzz' | 'thought' | 'heart' | 'gear' | 'tear';
++type Prop = 'magnifier' | 'laptop' | null;
++
++interface Pose {
++  armL: number;          // radians, 0 = hanging, positive = raised outward, negative = across the body
++  armR: number;
++  armRFront?: boolean;   // draw right arm in front of the head (hand on chin)
++  tilt: number;          // head tilt (radians)
++  look?: [number, number] | 'scan' | 'down' | 'up'; // eye override, else follows cursor
++  eyeOpen: number;       // 1 normal, 1.25 wide, 0 closed line
++  happyEyes: number;     // 0..1 morph to ^ ^
++  pupil: number;         // pupil scale
++  brow: number;          // + worried/sad, - angry
++  browY: number;         // vertical brow offset (- raised)
++  mouth: MouthShape;
++  blush: number;
++  bounce: number;        // hop amplitude
++  shake: number;         // head-shake amplitude
++  effects: Effect[];
++  prop: Prop;
++  typing?: boolean;
++  droop?: number;        // sleepy head droop
++}
++
++const BASE: Pose = {
++  armL: 0.12, armR: 0.12, tilt: 0, eyeOpen: 1, happyEyes: 0, pupil: 1, brow: 0, browY: 0,
++  mouth: 'smile', blush: 0.35, bounce: 0, shake: 0, effects: [], prop: null,
++};
++
++const POSES: Record<string, Partial<Pose>> = {
++  idle: {},
++  speaking: { mouth: 'smile' },
++  thinking: { armR: -1.8, armRFront: true, look: 'up', mouth: 'flat', browY: -3, brow: 0.15, tilt: -0.08, effects: ['thought'] },
++  reading: { look: 'down', mouth: 'flat', tilt: 0.05 },
++  waiting_user: { armL: 0.35, armR: 0.35, look: [0, 0], mouth: 'cat', tilt: 0.12 },
++  searching: { armR: -2.25, armRFront: true, prop: 'magnifier', look: 'scan', mouth: 'o', browY: -2 },
++  coding: { armL: -0.55, armR: -0.55, prop: 'laptop', typing: true, look: 'down', mouth: 'flat', brow: -0.15 },
++  terminal: { armL: -0.55, armR: -0.55, prop: 'laptop', typing: true, look: 'down', mouth: 'cat', effects: ['gear'] },
++  testing: { armL: -0.55, armR: -0.55, prop: 'laptop', typing: true, look: 'down', mouth: 'flat', effects: ['gear'] },
++  happy: { armL: 2.25, armR: 2.25, happyEyes: 1, mouth: 'grin', blush: 0.8, bounce: 14, effects: ['sparkles'] },
++  success: { armL: 2.4, armR: 2.4, happyEyes: 1, mouth: 'grin', blush: 0.7, bounce: 18, effects: ['sparkles'] },
++  doubleClicked: { armL: 2.2, armR: 2.2, happyEyes: 1, mouth: 'grin', blush: 0.9, bounce: 10, effects: ['heart'] },
++  clicked: { happyEyes: 0.6, mouth: 'cat', blush: 0.7, effects: ['heart'] },
++  surprised: { armL: 1.2, armR: 1.2, eyeOpen: 1.25, pupil: 0.65, mouth: 'o', browY: -7, bounce: 8, effects: ['exclaim'] },
++  confused: { tilt: 0.28, mouth: 'wavy', brow: 0.25, browY: -2, effects: ['question'], armR: -1.9, armRFront: true },
++  angry: { armL: 0.7, armR: 0.7, brow: -0.45, browY: 3, mouth: 'pout', blush: 0.6, effects: ['anger'] },
++  error: { brow: 0.4, eyeOpen: 1.1, pupil: 0.8, mouth: 'wavy', shake: 0.08, effects: ['sweat'] },
++  sleep: { eyeOpen: 0, mouth: 'o', droop: 1, tilt: 0.18, blush: 0.5, effects: ['zzz'], armL: 0.05, armR: 0.05 },
++  wake: { armL: 2.8, armR: 2.8, eyeOpen: 0.5, mouth: 'o', bounce: 4 },
++  dragging: { armL: 2.0, armR: 2.0, eyeOpen: 1.2, pupil: 0.7, mouth: 'o', browY: -6, effects: ['sweat'] },
++};
++
++/** Reaction poses that settle back to idle on their own (seconds; extended while still speaking). */
++const MOMENTARY_SECONDS: Record<string, number> = {
++  clicked: 1.2, doubleClicked: 2.5, wake: 2, happy: 3.5, success: 3.5, surprised: 2.5,
++  confused: 4, angry: 4, error: 4,
++};
++
++const EXPRESSIONS: Record<string, Partial<Pose>> = {
++  neutral: {},
++  focused: { brow: -0.12, mouth: 'flat' },
++  happy: { happyEyes: 1, mouth: 'grin', blush: 0.7 },
++  smile: { happyEyes: 0.5, mouth: 'smile', blush: 0.6 },
++  sad: { brow: 0.45, mouth: 'frown', eyeOpen: 0.85, look: 'down', effects: ['tear'] },
++  worried: { brow: 0.4, mouth: 'wavy', effects: ['sweat'] },
++  angry: { brow: -0.45, browY: 3, mouth: 'pout', effects: ['anger'] },
++  surprised: { eyeOpen: 1.25, pupil: 0.65, mouth: 'o', browY: -7 },
++  confused: { tilt: 0.25, mouth: 'wavy', effects: ['question'] },
++  shy: { blush: 1, happyEyes: 0.4, mouth: 'cat', look: 'down', tilt: 0.12 },
++};
++
++/** Damped spring for physics-y motion (hair, ahoge, squash). */
++class Spring {
++  v = 0;
++  constructor(public x = 0, private k = 120, private d = 9) {}
++  step(target: number, dt: number): number {
++    const a = (target - this.x) * this.k - this.v * this.d;
++    this.v += a * dt;
++    this.x += this.v * dt;
++    return this.x;
++  }
++  kick(impulse: number) { this.v += impulse; }
++}
++
++const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
++const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
++
++export class ChibiRenderer implements PetRenderer {
++  private canvas: HTMLCanvasElement | null = null;
++  private ctx: CanvasRenderingContext2D | null = null;
++  private raf = 0;
++  private lastTime = 0;
++  private time = 0;
++  private ready = false;
++
++  // animation state
++  private action = 'idle';
++  private actionStart = 0;
++  private expression: Partial<Pose> | null = null;
++  private pose: Pose = { ...BASE };
++  private cur = { armL: BASE.armL, armR: BASE.armR, tilt: 0, eyeOpen: 1, happyEyes: 0, pupil: 1, brow: 0, browY: 0, blush: 0.35, droop: 0 };
++  private lookTarget = { x: 0, y: 0 };
++  private look = { x: 0, y: 0 };
++  private lastLookAt = 0;
++  private wander = { x: 0, y: 0, next: 0 };
++  private blinkT = 0;
++  private nextBlink = 2;
++  private blinkPhase = -1;        // -1 none, else 0..1
++  private speaking = false;
++  private amp = 0;
++  private mouthOpen = 0;
++  private squash = new Spring(0, 260, 14);
++  private ahoge = new Spring(0, 90, 5);
++  private tailL = new Spring(0, 40, 4);
++  private tailR = new Spring(0, 40, 4);
++  private prevHeadX = 0;
++  private idleSince = 0;
++  private nextFidget = 8;
++
++  get view(): HTMLCanvasElement | null {
++    return this.canvas;
++  }
++
++  get initialized(): boolean {
++    return this.ready;
++  }
++
++  // ───────────────────────── lifecycle ─────────────────────────
++  async loadModel(modelConfig: ModelConfig): Promise<void> {
++    const size = modelConfig.canvas ?? modelConfig.window ?? { width: 420, height: 540 };
++    if (!this.canvas) {
++      this.canvas = document.createElement('canvas');
++      this.ctx = this.canvas.getContext('2d');
++    }
++    this.resize(size.width, size.height);
++    this.ready = true;
++    this.lastTime = performance.now();
++    if (!this.raf) this.raf = requestAnimationFrame(this.frame);
++  }
++
++  async switchModel(modelConfig: ModelConfig, _fallbackIndex = 0): Promise<void> {
++    await this.loadModel(modelConfig);
++  }
++
++  resize(width: number, height: number): void {
++    if (!this.canvas) return;
++    const dpr = window.devicePixelRatio || 1;
++    this.canvas.width = Math.round(width * dpr);
++    this.canvas.height = Math.round(height * dpr);
++    this.canvas.style.width = `${width}px`;
++    this.canvas.style.height = `${height}px`;
++  }
++
++  destroy(): void {
++    this.ready = false;
++    if (this.raf) cancelAnimationFrame(this.raf);
++    this.raf = 0;
++    this.canvas?.remove();
++    this.canvas = null;
++    this.ctx = null;
++  }
++
++  // ───────────────────────── PetRenderer API ─────────────────────────
++  async playAction(actionName: string, _options: PlayActionOptions = {}): Promise<void> {
++    if (!(actionName in POSES)) return; // unknown / "keep" → keep current pose
++    if (actionName !== this.action || actionName !== 'idle') {
++      this.action = actionName;
++      this.actionStart = this.time;
++    }
++    if (actionName === 'clicked') this.squash.kick(-3.2);
++    if (actionName === 'happy' || actionName === 'success' || actionName === 'surprised') {
++      this.squash.kick(-2.5); // anticipation crouch before the hop
++      this.ahoge.kick(9);
++    }
++    if (actionName === 'doubleClicked') { this.squash.kick(-4); this.ahoge.kick(12); }
++    this.idleSince = this.time;
++  }
++
++  async playMotion(group: string, _index = 0, options: PlayActionOptions = {}): Promise<void> {
++    await this.playAction(group.toLowerCase(), options);
++  }
++
++  async setExpression(name: string): Promise<void> {
++    this.expression = EXPRESSIONS[name.toLowerCase()] ?? null;
++  }
++
++  resetExpression(): void {
++    this.expression = null;
++  }
++
++  setParameters(_params: Record<string, number>): void {
++    // Live2D parameter props don't apply to the procedural character.
++  }
++
++  setSpeaking(speaking: boolean, amplitude = 0): void {
++    this.speaking = speaking;
++    this.amp = speaking ? clamp(amplitude, 0, 1) : 0;
++  }
++
++  async speak(_text: string): Promise<void> {}
++
++  /** x/y in canvas pixel coordinates (as PetStage passes them). */
++  lookAt(x: number, y: number): void {
++    if (!this.canvas) return;
++    const { s, ox, oy } = this.layout();
++    const dx = (x - ox) / s - HEAD.x;
++    const dy = (y - oy) / s - (HEAD.y + 10);
++    const dist = Math.hypot(dx, dy) || 1;
++    const reach = clamp(dist / 260, 0, 1);
++    const tx = (dx / dist) * reach;
++    const ty = (dy / dist) * reach;
++    if (Math.abs(tx - this.lookTarget.x) > 0.01 || Math.abs(ty - this.lookTarget.y) > 0.01) {
++      this.lastLookAt = this.time;
++    }
++    this.lookTarget = { x: tx, y: ty };
++  }
++
++  resetPointer(): void {
++    this.lookTarget = { x: 0, y: 0 };
++  }
++
++  forceResetPose(): void {
++    this.lookTarget = { x: 0, y: 0 };
++    this.look = { x: 0, y: 0 };
++  }
++
++  idle(): void {
++    void this.playAction('idle');
++  }
++
++  hitTestClientPoint(clientX: number, clientY: number): boolean {
++    const p = this.clientToDesign(clientX, clientY);
++    if (!p) return false;
++    const { x, y } = p;
++    const inEllipse = (cx: number, cy: number, rx: number, ry: number) =>
++      ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1;
++    return inEllipse(HEAD.x, HEAD.y - 10, 135, 128)         // head + hair
++      || inEllipse(HEAD.x, 50, 22, 32)                        // ahoge
++      || (x > 65 && x < 335 && y > 200 && y < 380 && (x < 125 || x > 275)) // twin tails
++      || (x > 120 && x < 280 && y > 280 && y < 470);         // body + legs
++  }
++
++  getOpaqueBoundsClient(): DOMRect | null {
++    if (!this.canvas) return null;
++    const rect = this.canvas.getBoundingClientRect();
++    if (rect.width <= 0 || this.canvas.width <= 0) return null;
++    const { s, ox, oy } = this.layout();
++    const k = rect.width / this.canvas.width; // canvas px → css px
++    return new DOMRect(
++      rect.left + (ox + FIGURE_BOUNDS.x * s) * k,
++      rect.top + (oy + FIGURE_BOUNDS.y * s) * k,
++      FIGURE_BOUNDS.w * s * k,
++      FIGURE_BOUNDS.h * s * k,
++    );
++  }
++
++  /** Touch regions tuned to the chibi proportions (big head). */
++  detectRegion(clientX: number, clientY: number): string {
++    const p = this.clientToDesign(clientX, clientY);
++    if (!p) return 'clothing';
++    if (p.y < 125 || (p.y < 230 && (p.x < 95 || p.x > 305))) return 'head';
++    if (p.y < 290) return 'face';
++    if (p.y < 420 && (p.x < 150 || p.x > 250)) return 'hand';
++    return 'clothing';
++  }
++
++  // ───────────────────────── internals ─────────────────────────
++  private layout() {
++    const cw = this.canvas?.width ?? DESIGN_W;
++    const ch = this.canvas?.height ?? DESIGN_H;
++    const s = Math.min(cw / DESIGN_W, ch / DESIGN_H);
++    return { s, ox: (cw - DESIGN_W * s) / 2, oy: ch - DESIGN_H * s };
++  }
++
++  private clientToDesign(clientX: number, clientY: number): { x: number; y: number } | null {
++    if (!this.canvas) return null;
++    const rect = this.canvas.getBoundingClientRect();
++    if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return null;
++    const px = ((clientX - rect.left) / rect.width) * this.canvas.width;
++    const py = ((clientY - rect.top) / rect.height) * this.canvas.height;
++    const { s, ox, oy } = this.layout();
++    return { x: (px - ox) / s, y: (py - oy) / s };
++  }
++
++  private frame = (now: number) => {
++    if (!this.ready) return;
++    const dt = Math.min(0.05, (now - this.lastTime) / 1000);
++    this.lastTime = now;
++    this.time += dt;
++    this.update(dt);
++    this.draw();
++    this.raf = requestAnimationFrame(this.frame);
++  };
++
++  private targetPose(): Pose {
++    const pose: Pose = { ...BASE, ...POSES[this.action], ...(this.expression ?? {}) };
++    pose.effects = [...(POSES[this.action]?.effects ?? []), ...(this.expression?.effects ?? [])];
++    return pose;
++  }
++
++  private update(dt: number): void {
++    const p = this.targetPose();
++    this.pose = p;
++    const t = 1 - Math.pow(0.0008, dt); // frame-rate independent smoothing
++    const c = this.cur;
++    c.armL = lerp(c.armL, p.armL, t);
++    c.armR = lerp(c.armR, p.armR, t);
++    c.tilt = lerp(c.tilt, p.tilt, t * 0.8);
++    c.eyeOpen = lerp(c.eyeOpen, p.eyeOpen, t);
++    c.happyEyes = lerp(c.happyEyes, p.happyEyes, t);
++    c.pupil = lerp(c.pupil, p.pupil, t);
++    c.brow = lerp(c.brow, p.brow, t);
++    c.browY = lerp(c.browY, p.browY, t);
++    c.blush = lerp(c.blush, p.blush, t * 0.5);
++    c.droop = lerp(c.droop, p.droop ?? 0, t * 0.4);
++
++    // eyes: pose override → cursor → wander when cursor is still
++    let target = this.lookTarget;
++    if (p.look === 'up') target = { x: 0.45, y: -0.6 };
++    else if (p.look === 'down') target = { x: 0, y: 0.55 };
++    else if (p.look === 'scan') target = { x: Math.sin(this.time * 2.2) * 0.8, y: 0.15 };
++    else if (Array.isArray(p.look)) target = { x: p.look[0], y: p.look[1] };
++    else if (this.time - this.lastLookAt > 4) {
++      if (this.time > this.wander.next) {
++        this.wander = { x: (Math.random() - 0.5) * 1.2, y: (Math.random() - 0.5) * 0.6, next: this.time + 1.5 + Math.random() * 3 };
++      }
++      target = this.wander;
++    }
++    this.look.x = lerp(this.look.x, target.x, 1 - Math.pow(0.0001, dt));
++    this.look.y = lerp(this.look.y, target.y, 1 - Math.pow(0.0001, dt));
++
++    // blinking (with occasional double blink)
++    if (this.blinkPhase < 0) {
++      this.blinkT += dt;
++      if (this.blinkT > this.nextBlink) {
++        this.blinkPhase = 0;
++        this.blinkT = 0;
++        this.nextBlink = Math.random() < 0.2 ? 0.25 : 2 + Math.random() * 4;
++      }
++    } else {
++      this.blinkPhase += dt / 0.16;
++      if (this.blinkPhase >= 1) this.blinkPhase = -1;
++    }
++
++    // lip sync: RMS (~0.02–0.25) → mouth opening, with a little flutter
++    const wantOpen = this.speaking ? clamp(this.amp * 5.5, 0, 1) * (0.75 + 0.25 * Math.sin(this.time * 31)) : 0;
++    this.mouthOpen = lerp(this.mouthOpen, wantOpen, 1 - Math.pow(0.00001, dt));
++
++    // physics
++    const headX = this.look.x * 6 + Math.sin(this.time * 1.3) * 1.5;
++    const headVel = (headX - this.prevHeadX) / Math.max(dt, 0.001);
++    this.prevHeadX = headX;
++    this.squash.step(0, dt);
++    this.ahoge.step(-headVel * 0.02 + Math.sin(this.time * 2) * 0.05, dt);
++    const sway = Math.sin(this.time * 1.6) * 0.04;
++    this.tailL.step(-headVel * 0.01 + sway + c.tilt * 0.5, dt);
++    this.tailR.step(-headVel * 0.01 + sway + c.tilt * 0.5, dt);
++    if (this.speaking && this.mouthOpen > 0.6 && Math.random() < 0.03) this.ahoge.kick(2);
++
++    // momentary actions settle back to idle
++    const elapsed = this.time - this.actionStart;
++    const hold = MOMENTARY_SECONDS[this.action];
++    if (hold !== undefined && elapsed > hold && !(this.speaking && this.action !== 'clicked')) {
++      this.action = 'idle';
++    }
++
++    // idle fidgets
++    if (this.action === 'idle' && !this.speaking) {
++      if (this.time - this.idleSince > this.nextFidget) {
++        this.idleSince = this.time;
++        this.nextFidget = 8 + Math.random() * 14;
++        const r = Math.random();
++        if (r < 0.4) this.ahoge.kick(6);
++        else if (r < 0.7) this.squash.kick(-1.5);
++        else this.wander = { x: (Math.random() - 0.5) * 1.6, y: -0.3, next: this.time + 2 };
++      }
++    }
++  }
++
++  // ───────────────────────── drawing ─────────────────────────
++  private draw(): void {
++    const ctx = this.ctx;
++    const canvas = this.canvas;
++    if (!ctx || !canvas) return;
++    ctx.setTransform(1, 0, 0, 1, 0, 0);
++    ctx.clearRect(0, 0, canvas.width, canvas.height);
++    const { s, ox, oy } = this.layout();
++    ctx.setTransform(s, 0, 0, s, ox, oy);
++    ctx.lineJoin = 'round';
++    ctx.lineCap = 'round';
++
++    const p = this.pose;
++    const c = this.cur;
++    const elapsed = this.time - this.actionStart;
++    const breath = Math.sin(this.time * 2.1);
++    const hopT = elapsed - 0.12;
++    const hop = p.bounce && hopT > 0 ? Math.abs(Math.sin(hopT * 7)) * p.bounce * Math.max(0, 1 - hopT / 2.5) : 0;
++    const dragSwing = this.action === 'dragging' ? Math.sin(this.time * 9) * 0.25 : 0;
++
++    // ground shadow
++    ctx.fillStyle = 'rgba(40, 30, 70, 0.18)';
++    ctx.beginPath();
++    ctx.ellipse(200, 468, 74 - hop * 1.2, 10, 0, 0, Math.PI * 2);
++    ctx.fill();
++
++    // whole-body squash anchored at the feet
++    const sq = this.squash.x * 0.06;
++    ctx.save();
++    ctx.translate(200, 466 - hop);
++    ctx.scale(1 - sq * 0.6, 1 + sq);
++    ctx.translate(-200, -466);
++
++    this.drawLegs(dragSwing);
++    this.drawTails(c.tilt);
++    this.drawBody(breath);
++    if (p.prop === 'laptop') this.drawLaptop();
++    // arms raised high (cheering) or hand-on-chin are drawn in front of the head
++    const frontL = c.armL > 1.6;
++    const frontR = Boolean(p.armRFront) || c.armR > 1.6;
++    if (!frontL) this.drawArm('L', c.armL, breath, dragSwing);
++    if (!frontR) this.drawArm('R', c.armR, breath, dragSwing);
++
++    // head (tilt + droop + shake + breathing bob)
++    const shake = p.shake ? Math.sin(this.time * 28) * p.shake * Math.max(0, 1 - elapsed / 1.5) : 0;
++    const headX = this.look.x * 6;
++    const headY = breath * 1.6 + c.droop * 8 + this.look.y * 3;
++    ctx.save();
++    ctx.translate(HEAD.x + headX, HEAD.y + 70 + headY);
++    ctx.rotate(c.tilt + shake + Math.sin(this.time * 1.3) * 0.02);
++    ctx.translate(-HEAD.x, -(HEAD.y + 70));
++    this.drawHead();
++    ctx.restore();
++
++    if (frontL) this.drawArm('L', c.armL, breath, dragSwing);
++    if (frontR) this.drawArm('R', c.armR, breath, dragSwing);
++    if (p.prop === 'magnifier') this.drawMagnifier(c.armR);
++    ctx.restore();
++
++    this.drawEffects(p.effects, elapsed);
++  }
++
++  private outlineFill(fill: string | CanvasGradient, width = 3) {
++    const ctx = this.ctx!;
++    ctx.fillStyle = fill;
++    ctx.fill();
++    ctx.strokeStyle = C.outline;
++    ctx.lineWidth = width;
++    ctx.stroke();
++  }
++
++  private hairGradient(y0: number, y1: number): CanvasGradient {
++    const g = this.ctx!.createLinearGradient(0, y0, 0, y1);
++    g.addColorStop(0, C.hairTop);
++    g.addColorStop(1, C.hairBottom);
++    return g;
++  }
++
++  private drawLegs(swing: number) {
++    // short, rounded legs (chibi: limbs stay small so the head dominates)
++    const ctx = this.ctx!;
++    for (const side of [-1, 1]) {
++      ctx.save();
++      ctx.translate(200 + side * 22, 400);
++      ctx.rotate(swing * side);
++      ctx.beginPath();
++      ctx.roundRect(-14, 0, 28, 50, 13);
++      this.outlineFill(C.tights);
++      // sock cuff
++      ctx.fillStyle = C.hoodie;
++      ctx.beginPath();
++      ctx.roundRect(-13, 36, 26, 9, 4);
++      ctx.fill();
++      ctx.beginPath();
++      ctx.ellipse(side * 3, 54, 20, 12, 0, 0, Math.PI * 2);
++      this.outlineFill(C.shoe);
++      ctx.fillStyle = 'rgba(255,255,255,0.35)';
++      ctx.beginPath();
++      ctx.ellipse(side * 3 - 6, 50, 6, 3, -0.3, 0, Math.PI * 2);
++      ctx.fill();
++      ctx.restore();
++    }
++  }
++
++  private drawTails(tilt: number) {
++    const ctx = this.ctx!;
++    const tails: Array<[number, Spring]> = [[-1, this.tailL], [1, this.tailR]];
++    for (const [side, spring] of tails) {
++      const ax = 200 + side * 112;
++      const ay = 150;
++      ctx.save();
++      ctx.translate(ax, ay);
++      ctx.rotate(spring.x * 1.2 + side * 0.12 + tilt * 0.3);
++      ctx.beginPath();
++      ctx.moveTo(-side * 6, 0);
++      ctx.bezierCurveTo(side * 48, 40, side * 46, 150, side * 18, 220);
++      ctx.bezierCurveTo(side * 10, 200, -side * 4, 180, -side * 14, 150);
++      ctx.bezierCurveTo(-side * 20, 100, -side * 22, 40, -side * 6, 0);
++      this.outlineFill(this.hairGradient(0, 220));
++      ctx.strokeStyle = C.hairShine;
++      ctx.lineWidth = 4;
++      ctx.beginPath();
++      ctx.moveTo(side * 6, 40);
++      ctx.quadraticCurveTo(side * 24, 100, side * 16, 160);
++      ctx.stroke();
++      ctx.restore();
++      // ribbon tie
++      ctx.save();
++      ctx.translate(ax, ay + 4);
++      ctx.beginPath();
++      ctx.ellipse(-10, 0, 12, 8, -0.4, 0, Math.PI * 2);
++      ctx.ellipse(10, 0, 12, 8, 0.4, 0, Math.PI * 2);
++      this.outlineFill(C.trim, 2.5);
++      ctx.beginPath();
++      ctx.arc(0, 0, 5, 0, Math.PI * 2);
++      this.outlineFill(C.star, 2);
++      ctx.restore();
++    }
++  }
++
++  private drawBody(breath: number) {
++    const ctx = this.ctx!;
++    const b = breath * 1.5;
++    // hood rim behind the neck
++    ctx.beginPath();
++    ctx.ellipse(200, 294, 54, 20, 0, 0, Math.PI * 2);
++    this.outlineFill(C.hoodieShade);
++    // pear-shaped torso: narrow shoulders, round bottom
++    ctx.beginPath();
++    ctx.moveTo(156, 292 - b);
++    ctx.quadraticCurveTo(200, 282 - b, 244, 292 - b);
++    ctx.bezierCurveTo(262, 330, 276, 380, 266, 404);
++    ctx.quadraticCurveTo(200, 418, 134, 404);
++    ctx.bezierCurveTo(124, 380, 138, 330, 156, 292 - b);
++    const g = ctx.createLinearGradient(0, 285, 0, 412);
++    g.addColorStop(0, C.hoodie);
++    g.addColorStop(1, C.hoodieShade);
++    this.outlineFill(g);
++    // hem trim + kangaroo pocket
++    ctx.strokeStyle = C.trim;
++    ctx.lineWidth = 7;
++    ctx.beginPath();
++    ctx.moveTo(138, 398);
++    ctx.quadraticCurveTo(200, 411, 262, 398);
++    ctx.stroke();
++    ctx.beginPath();
++    ctx.roundRect(170, 366, 60, 24, 9);
++    ctx.fillStyle = 'rgba(214, 190, 160, 0.35)';
++    ctx.fill();
++    ctx.strokeStyle = 'rgba(59, 47, 94, 0.55)';
++    ctx.lineWidth = 1.8;
++    ctx.stroke();
++    // drawstrings swing a little (secondary motion)
++    const swingX = -this.look.x * 3 + Math.sin(this.time * 2.1) * 1.2;
++    ctx.strokeStyle = C.trim;
++    ctx.lineWidth = 3;
++    for (const x of [189, 211]) {
++      const ex = x + (x < 200 ? -2 : 2) + swingX;
++      ctx.beginPath();
++      ctx.moveTo(x, 298 - b);
++      ctx.quadraticCurveTo(x, 316 - b, ex, 330 - b);
++      ctx.stroke();
++      ctx.beginPath();
++      ctx.arc(ex, 333 - b, 3.5, 0, Math.PI * 2);
++      ctx.fillStyle = C.trim;
++      ctx.fill();
++    }
++    this.star(200, 344 - b * 0.5, 11, C.star, 0.1);
++  }
++
++  private drawArm(side: 'L' | 'R', angle: number, breath: number, swing: number) {
++    const ctx = this.ctx!;
++    const dir = side === 'L' ? -1 : 1;
++    const sx = 200 + dir * 46;
++    const sy = 302 - breath * 1.5;
++    let a = angle + swing * 0.6;
++    if (this.pose.typing) a += Math.sin(this.time * 18 + (dir > 0 ? 1.5 : 0)) * 0.06;
++    if (this.pose.bounce && angle > 1.5) a += Math.sin(this.time * 9 + dir) * 0.15; // cheering wiggle
++    ctx.save();
++    ctx.translate(sx, sy);
++    ctx.rotate(-dir * a);
++    // chubby sleeve, wider at the cuff
++    ctx.beginPath();
++    ctx.moveTo(-11, -2);
++    ctx.quadraticCurveTo(-17, 30, -15, 52);
++    ctx.lineTo(15, 52);
++    ctx.quadraticCurveTo(17, 30, 11, -2);
++    ctx.closePath();
++    this.outlineFill(C.hoodie);
++    ctx.strokeStyle = C.trim;
++    ctx.lineWidth = 5;
++    ctx.beginPath();
++    ctx.moveTo(-14, 49);
++    ctx.lineTo(14, 49);
++    ctx.stroke();
++    // mitten hand
++    ctx.beginPath();
++    ctx.ellipse(0, 63, 12, 12.5, 0, 0, Math.PI * 2);
++    this.outlineFill(C.skin);
++    ctx.restore();
++  }
++
++  private handPos(side: 'L' | 'R', angle: number) {
++    const dir = side === 'L' ? -1 : 1;
++    return { x: 200 + dir * 46 + dir * Math.sin(angle) * 63, y: 302 + Math.cos(angle) * 63 };
++  }
++
++  private drawLaptop() {
++    const ctx = this.ctx!;
++    // screen (back)
++    ctx.beginPath();
++    ctx.moveTo(142, 320);
++    ctx.lineTo(258, 320);
++    ctx.lineTo(252, 382);
++    ctx.lineTo(148, 382);
++    ctx.closePath();
++    this.outlineFill('#c9cfe0');
++    ctx.fillStyle = `rgba(80, 220, 200, ${0.35 + 0.1 * Math.sin(this.time * 6)})`;
++    ctx.fillRect(154, 328, 92, 46);
++    ctx.fillStyle = 'rgba(255,255,255,0.8)';
++    for (let i = 0; i < 4; i++) {
++      const w = 20 + ((i * 37 + Math.floor(this.time * 4)) % 50);
++      ctx.fillRect(160, 334 + i * 10, w, 3);
++    }
++    // base
++    ctx.beginPath();
++    ctx.moveTo(130, 382);
++    ctx.lineTo(270, 382);
++    ctx.lineTo(262, 394);
++    ctx.lineTo(138, 394);
++    ctx.closePath();
++    this.outlineFill('#aeb5cc');
++  }
++
++  private drawMagnifier(armAngle: number) {
++    const ctx = this.ctx!;
++    const h = this.handPos('R', armAngle);
++    ctx.save();
++    ctx.translate(h.x, h.y);
++    ctx.rotate(-0.6 + Math.sin(this.time * 2.2) * 0.15);
++    ctx.strokeStyle = '#8a5a2b';
++    ctx.lineWidth = 7;
++    ctx.beginPath();
++    ctx.moveTo(0, 0);
++    ctx.lineTo(0, -34);
++    ctx.stroke();
++    ctx.beginPath();
++    ctx.arc(0, -56, 22, 0, Math.PI * 2);
++    ctx.fillStyle = 'rgba(190, 235, 255, 0.45)';
++    ctx.fill();
++    ctx.strokeStyle = C.outline;
++    ctx.lineWidth = 5;
++    ctx.stroke();
++    ctx.strokeStyle = 'rgba(255,255,255,0.8)';
++    ctx.lineWidth = 3;
++    ctx.beginPath();
++    ctx.arc(0, -56, 14, -2.6, -1.8);
++    ctx.stroke();
++    ctx.restore();
++  }
++
++  private drawHead() {
++    const ctx = this.ctx!;
++    const { x: hx, y: hy } = HEAD;
++    const fx = this.look.x * 12; // face features parallax → fake 3D head turn
++    const fy = this.look.y * 7;
++
++    // back hair: one soft rounded mass
++    ctx.beginPath();
++    ctx.moveTo(hx - 126, hy + 14);
++    ctx.bezierCurveTo(hx - 140, hy - 152, hx + 140, hy - 152, hx + 126, hy + 14);
++    ctx.bezierCurveTo(hx + 126, hy + 74, hx + 110, hy + 102, hx + 92, hy + 96);
++    ctx.lineTo(hx - 92, hy + 96);
++    ctx.bezierCurveTo(hx - 110, hy + 102, hx - 126, hy + 74, hx - 126, hy + 14);
++    this.outlineFill(this.hairGradient(hy - 130, hy + 100));
++
++    // face: wide chubby cheeks, tiny chin
++    const fxs = fx * 0.3;
++    ctx.beginPath();
++    ctx.moveTo(hx - 100 + fxs, hy - 16);
++    ctx.bezierCurveTo(hx - 106 + fxs, hy + 56, hx - 66 + fx * 0.5, hy + 96, hx + fx * 0.6, hy + 98);
++    ctx.bezierCurveTo(hx + 66 + fx * 0.5, hy + 96, hx + 106 + fxs, hy + 56, hx + 100 + fxs, hy - 16);
++    ctx.bezierCurveTo(hx + 100, hy - 110, hx - 100, hy - 110, hx - 100 + fxs, hy - 16);
++    const sg = ctx.createRadialGradient(hx + fx, hy + 6, 34, hx, hy + 20, 124);
++    sg.addColorStop(0, C.skin);
++    sg.addColorStop(1, C.skinShade);
++    this.outlineFill(sg);
++
++    // soft gradient blush
++    const blush = this.cur.blush;
++    if (blush > 0.02) {
++      for (const side of [-1, 1]) {
++        const bx = hx + side * 60 + fx;
++        const by = hy + 56 + fy;
++        const bg = ctx.createRadialGradient(bx, by, 2, bx, by, 24);
++        bg.addColorStop(0, `rgba(255, 130, 160, ${0.55 * blush})`);
++        bg.addColorStop(1, 'rgba(255, 130, 160, 0)');
++        ctx.fillStyle = bg;
++        ctx.beginPath();
++        ctx.ellipse(bx, by, 24, 14, 0, 0, Math.PI * 2);
++        ctx.fill();
++        if (blush > 0.6) {
++          ctx.strokeStyle = `rgba(230, 90, 120, ${blush - 0.4})`;
++          ctx.lineWidth = 2;
++          for (let i = -1; i <= 1; i++) {
++            ctx.beginPath();
++            ctx.moveTo(bx + i * 8 - 3, by + 4);
++            ctx.lineTo(bx + i * 8 + 3, by - 5);
++            ctx.stroke();
++          }
++        }
++      }
++    }
++
++    this.drawEyes(hx + fx, hy + 26 + fy);
++    this.drawBrows(hx + fx, hy - 20 + fy);
++    this.drawMouth(hx + fx * 1.1, hy + 72 + fy);
++    this.drawBangs(hx, hy, fx);
++    this.drawAhoge(hx - 10 + fx * 0.4, hy - 114);
++    this.star(hx + 88 + fx * 0.3, hy - 66, 15, C.star, 0.25);
++  }
++
++  private drawEyes(cx: number, cy: number) {
++    const ctx = this.ctx!;
++    const c = this.cur;
++    let open = c.eyeOpen;
++    if (this.blinkPhase >= 0) open *= Math.abs(1 - this.blinkPhase * 2);
++    const happy = c.happyEyes;
++    const ex = this.look.x * 7;
++    const ey = this.look.y * 6;
++
++    for (const side of [-1, 1]) {
++      const x = cx + side * 47;
++      const rx = 25;
++      const ry = 32 * clamp(open, 0, 1.3);
++      ctx.save();
++      if (happy > 0.5 || open < 0.12) {
++        // closed: ^ ^ when happy, soft curve when blinking / sleeping
++        ctx.strokeStyle = C.outline;
++        ctx.lineWidth = 5.5;
++        ctx.beginPath();
++        if (happy > 0.5) {
++          ctx.moveTo(x - 20, cy + 6);
++          ctx.quadraticCurveTo(x, cy - 20 * happy, x + 20, cy + 6);
++        } else {
++          ctx.moveTo(x - 20, cy + 2);
++          ctx.quadraticCurveTo(x, cy + 11, x + 20, cy + 2);
++        }
++        ctx.stroke();
++        ctx.restore();
++        continue;
++      }
++      // white
++      ctx.beginPath();
++      ctx.ellipse(x, cy, rx, ry, 0, 0, Math.PI * 2);
++      ctx.fillStyle = '#ffffff';
++      ctx.fill();
++      ctx.clip();
++      // big iris: dark rim, light lower half
++      const ix = x + ex;
++      const iy = cy + ey + 3;
++      const ig = ctx.createLinearGradient(0, iy - 27, 0, iy + 27);
++      ig.addColorStop(0, C.irisDark);
++      ig.addColorStop(0.5, C.iris);
++      ig.addColorStop(1, '#a6f5e8');
++      ctx.beginPath();
++      ctx.ellipse(ix, iy, 19.5, 26, 0, 0, Math.PI * 2);
++      ctx.fillStyle = ig;
++      ctx.fill();
++      ctx.strokeStyle = C.irisDark;
++      ctx.lineWidth = 2.5;
++      ctx.stroke();
++      // pupil
++      ctx.beginPath();
++      ctx.ellipse(ix, iy + 1, 8 * c.pupil, 12 * c.pupil, 0, 0, Math.PI * 2);
++      ctx.fillStyle = C.pupil;
++      ctx.fill();
++      // highlights: big, small, and a twinkling sparkle
++      ctx.fillStyle = '#ffffff';
++      ctx.beginPath();
++      ctx.ellipse(ix - 7, iy - 10, 7.5, 9, -0.3, 0, Math.PI * 2);
++      ctx.fill();
++      ctx.beginPath();
++      ctx.arc(ix + 8, iy + 11, 3.5, 0, Math.PI * 2);
++      ctx.fill();
++      ctx.globalAlpha = 0.6 + 0.4 * Math.sin(this.time * 3 + side);
++      this.sparkleWhite(ix + 9, iy - 13, 4);
++      ctx.globalAlpha = 1;
++      // upper lid shadow
++      ctx.fillStyle = 'rgba(59, 47, 94, 0.16)';
++      ctx.fillRect(x - rx, cy - ry, rx * 2, ry * 0.3);
++      ctx.restore();
++      // thick upper lash line
++      ctx.strokeStyle = C.outline;
++      ctx.lineWidth = 6;
++      ctx.beginPath();
++      ctx.ellipse(x, cy, rx + 1, ry + 1, 0, Math.PI * 1.06, Math.PI * 1.94);
++      ctx.stroke();
++      // outer lash flick
++      ctx.lineWidth = 4;
++      ctx.beginPath();
++      ctx.moveTo(x + side * (rx - 1), cy - ry * 0.5);
++      ctx.quadraticCurveTo(x + side * (rx + 6), cy - ry * 0.62, x + side * (rx + 9), cy - ry * 0.85);
++      ctx.stroke();
++      // soft lower lid
++      ctx.lineWidth = 2;
++      ctx.globalAlpha = 0.7;
++      ctx.beginPath();
++      ctx.ellipse(x, cy, rx - 2, ry, 0, Math.PI * 0.3, Math.PI * 0.7);
++      ctx.stroke();
++      ctx.globalAlpha = 1;
++    }
++  }
++
++  private sparkleWhite(x: number, y: number, r: number) {
++    const ctx = this.ctx!;
++    ctx.beginPath();
++    ctx.moveTo(x, y - r);
++    ctx.quadraticCurveTo(x, y, x + r, y);
++    ctx.quadraticCurveTo(x, y, x, y + r);
++    ctx.quadraticCurveTo(x, y, x - r, y);
++    ctx.quadraticCurveTo(x, y, x, y - r);
++    ctx.fillStyle = '#ffffff';
++    ctx.fill();
++  }
++
++  private drawBrows(cx: number, cy: number) {
++    const ctx = this.ctx!;
++    const c = this.cur;
++    ctx.strokeStyle = C.hairBottom;
++    ctx.lineWidth = 4.5;
++    for (const side of [-1, 1]) {
++      const x = cx + side * 46;
++      const y = cy + c.browY;
++      const tilt = c.brow * side; // + inner ends up (worried), - inner ends down (angry)
++      ctx.save();
++      ctx.translate(x, y);
++      ctx.rotate(-tilt);
++      ctx.beginPath();
++      ctx.moveTo(-15, 2);
++      ctx.quadraticCurveTo(0, -5, 15, 2);
++      ctx.stroke();
++      ctx.restore();
++    }
++  }
++
++  private drawMouth(x: number, y: number) {
++    const ctx = this.ctx!;
++    const open = this.mouthOpen;
++    ctx.strokeStyle = C.outline;
++    ctx.lineWidth = 3.5;
++    const shape = this.pose.mouth;
++
++    if (open > 0.08 || shape === 'o') {
++      // speaking / open mouth
++      const h = shape === 'o' && open < 0.1 ? 9 : 4 + open * 18;
++      const w = shape === 'o' && open < 0.1 ? 8 : 12 + open * 6;
++      ctx.beginPath();
++      if (shape === 'grin' || shape === 'smile') {
++        ctx.moveTo(x - w, y - 2);
++        ctx.quadraticCurveTo(x, y - 4, x + w, y - 2);
++        ctx.quadraticCurveTo(x + w * 0.6, y + h * 1.2, x, y + h * 1.25);
++        ctx.quadraticCurveTo(x - w * 0.6, y + h * 1.2, x - w, y - 2);
++      } else {
++        ctx.ellipse(x, y + h * 0.4, w * 0.8, h * 0.75, 0, 0, Math.PI * 2);
++      }
++      ctx.fillStyle = C.mouth;
++      ctx.fill();
++      ctx.stroke();
++      ctx.save();
++      ctx.clip();
++      ctx.fillStyle = C.tongue;
++      ctx.beginPath();
++      ctx.ellipse(x, y + h * 1.1, w * 0.6, h * 0.5, 0, 0, Math.PI * 2);
++      ctx.fill();
++      ctx.restore();
++      return;
++    }
++
++    ctx.beginPath();
++    switch (shape) {
++      case 'grin':
++        ctx.moveTo(x - 14, y - 2);
++        ctx.quadraticCurveTo(x, y - 3, x + 14, y - 2);
++        ctx.quadraticCurveTo(x, y + 18, x - 14, y - 2);
++        ctx.fillStyle = C.mouth;
++        ctx.fill();
++        break;
++      case 'smile':
++        ctx.moveTo(x - 10, y);
++        ctx.quadraticCurveTo(x, y + 8, x + 10, y);
++        break;
++      case 'cat':
++        ctx.moveTo(x - 12, y);
++        ctx.quadraticCurveTo(x - 6, y + 7, x, y);
++        ctx.quadraticCurveTo(x + 6, y + 7, x + 12, y);
++        break;
++      case 'frown':
++        ctx.moveTo(x - 10, y + 5);
++        ctx.quadraticCurveTo(x, y - 3, x + 10, y + 5);
++        break;
++      case 'wavy':
++        ctx.moveTo(x - 13, y + 2);
++        ctx.quadraticCurveTo(x - 6.5, y - 4, x, y + 2);
++        ctx.quadraticCurveTo(x + 6.5, y + 8, x + 13, y + 2);
++        break;
++      case 'pout':
++        ctx.moveTo(x - 8, y + 3);
++        ctx.quadraticCurveTo(x, y - 4, x + 8, y + 3);
++        break;
++      default: // flat
++        ctx.moveTo(x - 9, y + 2);
++        ctx.lineTo(x + 9, y + 2);
++    }
++    ctx.stroke();
++  }
++
++  private drawBangs(hx: number, hy: number, fx: number) {
++    const ctx = this.ctx!;
++    const shift = fx * 0.5;
++    const grad = this.hairGradient(hy - 120, hy + 70);
++
++    // side locks framing the cheeks, swaying with the twin tails
++    for (const side of [-1, 1]) {
++      const sway = (side < 0 ? this.tailL.x : this.tailR.x) * 10;
++      ctx.beginPath();
++      ctx.moveTo(hx + side * 70 + shift, hy - 40);
++      ctx.bezierCurveTo(hx + side * 112, hy - 10, hx + side * 112 + sway, hy + 40, hx + side * 98 + sway, hy + 74);
++      ctx.quadraticCurveTo(hx + side * 92 + sway, hy + 50, hx + side * 84 + shift, hy + 20);
++      ctx.quadraticCurveTo(hx + side * 80 + shift, hy - 10, hx + side * 70 + shift, hy - 40);
++      this.outlineFill(grad, 2.5);
++    }
++
++    // fringe: rounded crown with soft, slightly asymmetric locks
++    ctx.beginPath();
++    ctx.moveTo(hx - 110, hy - 2);
++    ctx.bezierCurveTo(hx - 118, hy - 128, hx + 118, hy - 128, hx + 110, hy - 2);
++    // [notch x after this lock, tip depth, tip lean]; right side first, part sits left of centre
++    const locks: Array<[number, number, number]> = [
++      [hx + 66, hy - 4, 8], [hx + 22, hy + 4, 6], [hx - 14, hy - 10, -2], [hx - 58, hy + 2, -6], [hx - 110, hy - 2, -8],
++    ];
++    let px = hx + 110;
++    const notchY = hy - 44;
++    for (const [nx, tipY, lean] of locks) {
++      const x = nx + shift;
++      const mid = (px + x) / 2 + lean;
++      const w = px - x;
++      // wide rounded petal: from the previous notch down to a soft tip, back up to the next notch
++      ctx.bezierCurveTo(px, tipY - 20, mid + w * 0.3, tipY + 2, mid, tipY);
++      ctx.bezierCurveTo(mid - w * 0.3, tipY + 2, x + 4, tipY - 22, x, notchY + (x < hx - 100 ? 42 : 0));
++      px = x;
++    }
++    ctx.closePath();
++    this.outlineFill(grad);
++
++    // glossy hair-shine band
++    ctx.strokeStyle = C.hairShine;
++    ctx.lineWidth = 8;
++    ctx.beginPath();
++    ctx.arc(hx + shift * 0.5, hy - 26, 94, Math.PI * 1.2, Math.PI * 1.4);
++    ctx.stroke();
++    ctx.lineWidth = 6;
++    ctx.beginPath();
++    ctx.arc(hx + shift * 0.5, hy - 26, 94, Math.PI * 1.55, Math.PI * 1.72);
++    ctx.stroke();
++  }
++
++  private drawAhoge(x: number, y: number) {
++    const ctx = this.ctx!;
++    const bend = this.ahoge.x;
++    ctx.beginPath();
++    ctx.moveTo(x - 6, y + 6);
++    ctx.bezierCurveTo(x - 10 + bend * 20, y - 40, x + 30 + bend * 40, y - 60, x + 26 + bend * 50, y - 78);
++    ctx.bezierCurveTo(x + 20 + bend * 30, y - 50, x + 4 + bend * 14, y - 26, x + 8, y + 6);
++    this.outlineFill(C.hairTop, 2.5);
++  }
++
++  private star(x: number, y: number, r: number, fill: string, rot = 0) {
++    const ctx = this.ctx!;
++    ctx.save();
++    ctx.translate(x, y);
++    ctx.rotate(rot);
++    ctx.beginPath();
++    for (let i = 0; i < 10; i++) {
++      const rr = i % 2 === 0 ? r : r * 0.48;
++      const a = (Math.PI / 5) * i - Math.PI / 2;
++      ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
++    }
++    ctx.closePath();
++    this.outlineFill(fill, 2.5);
++    ctx.restore();
++  }
++
++  private drawEffects(effects: Effect[], t: number) {
++    const ctx = this.ctx!;
++    const T = this.time;
++    for (const fx of effects) {
++      ctx.save();
++      switch (fx) {
++        case 'sparkles':
++          for (let i = 0; i < 5; i++) {
++            const ph = (T * 0.8 + i * 0.23) % 1;
++            const a = i * 1.3 + 0.4;
++            const x = 200 + Math.cos(a) * (150 + ph * 20);
++            const y = 170 + Math.sin(a) * 120 - ph * 30;
++            ctx.globalAlpha = Math.sin(ph * Math.PI);
++            this.sparkle(x, y, 9 + 6 * Math.sin(ph * Math.PI));
++          }
++          break;
++        case 'heart':
++          for (let i = 0; i < 3; i++) {
++            const ph = clamp((t - i * 0.25) / 1.4, 0, 1);
++            if (ph <= 0 || ph >= 1) continue;
++            ctx.globalAlpha = 1 - ph;
++            this.heart(250 + i * 28 + Math.sin(ph * 8) * 6, 110 - ph * 70, 11);
++          }
++          break;
++        case 'question':
++          this.glyph('?', 318, 78 + Math.sin(T * 3) * 5, 46, '#5b8def');
++          break;
++        case 'exclaim':
++          this.glyph('!', 316, 76 - Math.max(0, 0.3 - t) * 40, 50, '#ff5a6e');
++          break;
++        case 'sweat': {
++          const ph = (T * 0.6) % 1;
++          ctx.globalAlpha = 1 - ph * 0.6;
++          ctx.translate(96, 118 + ph * 26);
++          ctx.beginPath();
++          ctx.moveTo(0, -14);
++          ctx.quadraticCurveTo(10, 2, 0, 8);
++          ctx.quadraticCurveTo(-10, 2, 0, -14);
++          ctx.fillStyle = '#9fdcff';
++          ctx.fill();
++          ctx.strokeStyle = '#3d8fd6';
++          ctx.lineWidth = 2;
++          ctx.stroke();
++          break;
++        }
++        case 'tear': {
++          const ph = (T * 0.45) % 1;
++          ctx.globalAlpha = Math.min(1, (1 - ph) * 2);
++          ctx.translate(166 + this.look.x * 12, 262 + ph * 30 + this.look.y * 7);
++          ctx.beginPath();
++          ctx.moveTo(0, -8);
++          ctx.quadraticCurveTo(7, 3, 0, 7);
++          ctx.quadraticCurveTo(-7, 3, 0, -8);
++          ctx.fillStyle = '#bfe8ff';
++          ctx.fill();
++          ctx.strokeStyle = '#5aa8e0';
++          ctx.lineWidth = 1.5;
++          ctx.stroke();
++          break;
++        }
++        case 'anger': {
++          const sc = 1 + Math.sin(T * 10) * 0.12;
++          ctx.translate(296, 92);
++          ctx.scale(sc, sc);
++          ctx.strokeStyle = '#ff3b55';
++          ctx.lineWidth = 5;
++          for (let i = 0; i < 4; i++) {
++            ctx.rotate(Math.PI / 2);
++            ctx.beginPath();
++            ctx.moveTo(4, 4);
++            ctx.quadraticCurveTo(14, 4, 14, 14);
++            ctx.stroke();
++          }
++          break;
++        }
++        case 'zzz':
++          for (let i = 0; i < 3; i++) {
++            const ph = (T * 0.35 + i / 3) % 1;
++            ctx.globalAlpha = Math.sin(ph * Math.PI);
++            this.glyph('z', 300 + ph * 40 + Math.sin(ph * 6) * 6, 110 - ph * 80, 18 + ph * 16, '#7c6fd8');
++          }
++          break;
++        case 'thought': {
++          ctx.fillStyle = '#ffffff';
++          ctx.strokeStyle = C.outline;
++          ctx.lineWidth = 2.5;
++          const dots: Array<[number, number, number]> = [[292, 96, 5], [306, 76, 8]];
++          for (const [x, y, r] of dots) {
++            ctx.beginPath();
++            ctx.arc(x, y + Math.sin(T * 2 + x) * 2, r, 0, Math.PI * 2);
++            ctx.fill();
++            ctx.stroke();
++          }
++          ctx.beginPath();
++          ctx.ellipse(338, 42 + Math.sin(T * 2) * 3, 40, 24, 0, 0, Math.PI * 2);
++          ctx.fill();
++          ctx.stroke();
++          ctx.fillStyle = C.outline;
++          for (let i = 0; i < 3; i++) {
++            ctx.globalAlpha = 0.3 + 0.7 * Math.max(0, Math.sin(T * 4 - i * 0.8));
++            ctx.beginPath();
++            ctx.arc(324 + i * 14, 43 + Math.sin(T * 2) * 3, 3.5, 0, Math.PI * 2);
++            ctx.fill();
++          }
++          break;
++        }
++        case 'gear': {
++          ctx.translate(318, 70);
++          ctx.rotate(T * 2);
++          ctx.fillStyle = '#b8bfd6';
++          ctx.strokeStyle = C.outline;
++          ctx.lineWidth = 2.5;
++          ctx.beginPath();
++          for (let i = 0; i < 16; i++) {
++            const r = i % 2 === 0 ? 20 : 15;
++            const a = (Math.PI / 8) * i;
++            ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r);
++          }
++          ctx.closePath();
++          ctx.fill();
++          ctx.stroke();
++          ctx.beginPath();
++          ctx.arc(0, 0, 6, 0, Math.PI * 2);
++          ctx.fillStyle = '#ffffff';
++          ctx.fill();
++          ctx.stroke();
++          break;
++        }
++      }
++      ctx.restore();
++    }
++  }
++
++  private glyph(text: string, x: number, y: number, size: number, color: string) {
++    const ctx = this.ctx!;
++    ctx.font = `900 ${size}px "Segoe UI", system-ui, sans-serif`;
++    ctx.textAlign = 'center';
++    ctx.textBaseline = 'middle';
++    ctx.lineWidth = 6;
++    ctx.strokeStyle = '#ffffff';
++    ctx.strokeText(text, x, y);
++    ctx.fillStyle = color;
++    ctx.fillText(text, x, y);
++  }
++
++  private sparkle(x: number, y: number, r: number) {
++    const ctx = this.ctx!;
++    ctx.beginPath();
++    ctx.moveTo(x, y - r);
++    ctx.quadraticCurveTo(x, y, x + r, y);
++    ctx.quadraticCurveTo(x, y, x, y + r);
++    ctx.quadraticCurveTo(x, y, x - r, y);
++    ctx.quadraticCurveTo(x, y, x, y - r);
++    ctx.fillStyle = '#fff3a8';
++    ctx.fill();
++    ctx.strokeStyle = '#f2b200';
++    ctx.lineWidth = 1.5;
++    ctx.stroke();
++  }
++
++  private heart(x: number, y: number, r: number) {
++    const ctx = this.ctx!;
++    ctx.beginPath();
++    ctx.moveTo(x, y + r);
++    ctx.bezierCurveTo(x - r * 2, y - r * 0.4, x - r * 0.8, y - r * 1.8, x, y - r * 0.6);
++    ctx.bezierCurveTo(x + r * 0.8, y - r * 1.8, x + r * 2, y - r * 0.4, x, y + r);
++    ctx.fillStyle = '#ff6f91';
++    ctx.fill();
++    ctx.strokeStyle = '#c23b5c';
++    ctx.lineWidth = 2;
++    ctx.stroke();
++  }
++}
+diff --git a/apps/desktop/src/features/pet/renderer-factory.ts b/apps/desktop/src/features/pet/renderer-factory.ts
+new file mode 100644
+index 0000000..2fca11d
+--- /dev/null
++++ b/apps/desktop/src/features/pet/renderer-factory.ts
+@@ -0,0 +1,19 @@
++import { ChibiRenderer } from './ChibiRenderer';
++import { Live2DRenderer } from './Live2DRenderer';
++import { ModelConfig } from './model-registry';
++
++/** Either body ViviPet can show: a Live2D model or the code-drawn chibi. */
++export type AnyPetRenderer = Live2DRenderer | ChibiRenderer;
++
++/** Models whose path starts with "procedural:" are drawn in code instead of loaded from Live2D files. */
++export function rendererKind(model: ModelConfig | undefined): 'chibi' | 'live2d' {
++  return model?.path.startsWith('procedural:') ? 'chibi' : 'live2d';
++}
++
++export function createPetRenderer(model: ModelConfig | undefined): AnyPetRenderer {
++  return rendererKind(model) === 'chibi' ? new ChibiRenderer() : new Live2DRenderer();
++}
++
++export function isRendererFor(renderer: AnyPetRenderer, model: ModelConfig | undefined): boolean {
++  return (renderer instanceof ChibiRenderer) === (rendererKind(model) === 'chibi');
++}

@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "maxChars": 500,
+  "source": "local",
+  "interruptionStrategy": "queue",
+  "chunkSize": 16384,
+  "fallbackToBubble": true,
+  "local": {
+    "url": "http://127.0.0.1:8880/v1/audio/speech",
+    "api": "openai",
+    "model": "kokoro",
+    "voice": "af_heart",
+    "format": "mp3"
+  }
+}

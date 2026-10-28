@@ -1,0 +1,10 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Personal runtime data: the companion's memory of you, logs
+data/
+
+# Local overrides
+config.local.yaml

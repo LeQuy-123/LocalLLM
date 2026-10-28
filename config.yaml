@@ -1,0 +1,75 @@
+# Local AI Companion configuration
+# Everything runs locally: Ollama (brain + eyes), Kokoro (voice), ViviPet (body), OpenClaw (hands).
+
+companion:
+  name: Vivi
+  persona: >
+    You are Vivi, a cheerful, curious desktop companion who lives in the corner of the
+    user's screen. You are warm, playful and a little witty, but never annoying.
+    You keep spoken replies short (1-3 sentences) because they are read aloud.
+    You remember things about the user and use them naturally. You can see the
+    user's screen and control their PC with your tools when asked.
+
+ollama:
+  url: http://127.0.0.1:11434
+  # gemma-4-12b has vision + tools and fits in 12 GB VRAM alongside Kokoro.
+  chat_model: hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M
+  vision_model: hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M
+  num_ctx: 8192
+  keep_alive: 30m
+  temperature: 0.7
+
+pet:
+  adapter_url: http://127.0.0.1:18765
+  tts: true            # speak through Kokoro (configured in ViviPet); falls back to bubble
+  voice: af_heart      # any Kokoro voice, e.g. af_bella, af_nicole, bf_emma, am_adam
+
+screen:
+  enabled: true
+  check_interval_sec: 20      # how often the active window is sampled (cheap, no LLM)
+  min_comment_gap_sec: 240    # minimum time between unprompted remarks
+  look_on_window_change: true # only consider commenting when the user switched to something new
+  max_image_width: 1280
+  # Never screenshot / comment when these appear in the window title or process name.
+  privacy_blocklist:
+    - password
+    - keepass
+    - 1password
+    - bitwarden
+    - bank
+    - incognito
+    - inprivate
+    - private browsing
+
+openclaw:
+  enabled: true
+  agent: main
+  session_key: agent:main:companion
+  timeout_sec: 300
+
+# IoT devices the companion may control. Two driver types:
+#   homeassistant: calls a Home Assistant service on an entity
+#   http:          calls a URL per action (any webhook/ESPHome/Tasmota/Shelly endpoint)
+iot:
+  homeassistant:
+    url: ""            # e.g. http://homeassistant.local:8123
+    token: ""          # long-lived access token
+  devices: []
+  # Examples:
+  # - name: desk lamp
+  #   driver: homeassistant
+  #   entity_id: light.desk_lamp
+  # - name: fan
+  #   driver: http
+  #   actions:
+  #     on:  { method: GET, url: "http://192.168.1.50/relay/0?turn=on" }
+  #     off: { method: GET, url: "http://192.168.1.50/relay/0?turn=off" }
+
+server:
+  host: 127.0.0.1
+  port: 18800
+
+memory:
+  db_path: data/memory.db
+  history_turns: 12          # recent messages fed to the LLM
+  session_idle_min: 15       # after this much silence a conversation is summarised into an episode
